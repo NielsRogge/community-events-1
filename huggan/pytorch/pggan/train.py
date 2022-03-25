@@ -14,9 +14,11 @@ from torchvision.utils import make_grid
 
 import matplotlib.pyplot as plt
 
-from train import Generator, Discriminator
+from modeling_pggan import Generator, Discriminator
 
 from datasets import load_dataset
+
+from accelerate import Accelerator
 
 
 def parse_args(args=None):
@@ -27,11 +29,24 @@ def parse_args(args=None):
     parser.add_argument('--out_res', type=int, default=128, help='The resolution of final output image')
     parser.add_argument('--resume', type=int, default=0, help='continues from epoch number')
     parser.add_argument('--cuda', action='store_true', help='Using GPU to train')
+    parser.add_argument("--fp16", action="store_true", help="If passed, will use FP16 training.")
+    parser.add_argument(
+        "--mixed_precision",
+        type=str,
+        default="no",
+        choices=["no", "fp16", "bf16"],
+        help="Whether to use mixed precision. Choose"
+        "between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >= 1.10."
+        "and an Nvidia Ampere GPU.",
+    )
+    parser.add_argument("--cpu", action="store_true", help="If passed, will train on the CPU.")
 
     return parser.parse_args(args=args)
 
 
 def training_function(config, args):
+    accelerator = Accelerator(fp16=args.fp16, cpu=args.cpu, mixed_precision=args.mixed_precision)
+    
     checkpoint_dir = args.output_dir + 'checkpoints/'
     output_dir = args.output_dir + 'output/'
     weight_dir = args.output_dir+ 'weight/'
@@ -52,12 +67,10 @@ def training_function(config, args):
     lr = 1e-4
     lambd = 10
 
-    device = torch.device('cuda:0' if (torch.cuda.is_available() and args.cuda)  else 'cpu')
+    D_net = Discriminator(latent_size, out_res)
+    G_net = Generator(latent_size, out_res)
 
-    D_net = Discriminator(latent_size, out_res).to(device)
-    G_net = Generator(latent_size, out_res).to(device)
-
-    fixed_noise = torch.randn(16, latent_size, 1, 1, device=device)
+    fixed_noise = torch.randn(16, latent_size, 1, 1, device=accelerator.device)
     D_optimizer = torch.optim.Adam(D_net.parameters(), lr=lr, betas=(0, 0.99))
     G_optimizer = torch.optim.Adam(G_net.parameters(), lr=lr, betas=(0, 0.99))
 
@@ -137,6 +150,8 @@ def training_function(config, args):
     size = 2**(G_net.depth+1)
     print("Output Resolution: %d x %d" % (size, size))
 
+    D_net, G_net, D_optimizer, G_optimizer, data_loader = accelerator.prepare(D_net, G_net, D_optimizer, G_optimizer, data_loader)
+    
     for epoch in range(1+args.resume, args.epochs+1):
         G_net.train()
         D_epoch_loss = 0.0
@@ -160,18 +175,18 @@ def training_function(config, args):
         for i, samples in enumerate(databar):
             ##  update D
             if size != out_res:
-                samples = F.interpolate(samples["image"], size=size).to(device)
+                samples = F.interpolate(samples["image"], size=size).to(accelerator.device)
             else:
-                samples = samples["image"].to(device)
+                samples = samples["image"].to(accelerator.device)
             D_net.zero_grad()
-            noise = torch.randn(samples.size(0), latent_size, 1, 1, device=device)
+            noise = torch.randn(samples.size(0), latent_size, 1, 1, device=accelerator.device)
             fake = G_net(noise)
             fake_out = D_net(fake.detach())
             real_out = D_net(samples)
 
             ## Gradient Penalty
 
-            eps = torch.rand(samples.size(0), 1, 1, 1, device=device)
+            eps = torch.rand(samples.size(0), 1, 1, 1, device=accelerator.device)
             eps = eps.expand_as(samples)
             x_hat = eps * samples + (1 - eps) * fake.detach()
             x_hat.requires_grad = True
