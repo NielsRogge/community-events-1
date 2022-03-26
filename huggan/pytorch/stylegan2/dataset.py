@@ -1,4 +1,4 @@
-import random
+from random import random
 from PIL import Image
 from pathlib import Path
 

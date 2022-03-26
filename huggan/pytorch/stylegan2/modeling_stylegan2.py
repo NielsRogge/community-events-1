@@ -7,7 +7,7 @@ from math import floor, log2
 from functools import partial
 
 import numpy as np
-import random
+from random import random
 
 import torch
 from torch import nn, einsum

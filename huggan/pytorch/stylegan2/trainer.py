@@ -10,12 +10,14 @@ import math
 from math import floor, log2
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import grad as torch_grad
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torchvision
+from torchvision import transforms
 
 from einops import rearrange, repeat
 
@@ -23,13 +25,15 @@ from tqdm import tqdm
 
 import numpy as np
 from PIL import Image
-import random
+from random import random
 
 import multiprocessing
 
 from modeling_stylegan2 import StyleGAN2, EMA
 
 from dataset import Dataset
+
+from datasets import load_dataset
 
 try:
     from apex import amp
@@ -356,14 +360,94 @@ class Trainer():
         return {'image_size': self.image_size, 'network_capacity': self.network_capacity, 'lr_mlp': self.lr_mlp, 'transparent': self.transparent, 'fq_layers': self.fq_layers, 'fq_dict_size': self.fq_dict_size, 'attn_layers': self.attn_layers, 'no_const': self.no_const}
 
     def set_data_src(self, folder):
-        self.dataset = Dataset(folder, self.image_size, transparent = self.transparent, aug_prob = self.dataset_aug_prob)
+        # start of using HuggingFace dataset
+        dataset = load_dataset("mnist")
+        
+        def convert_rgb_to_transparent(image):
+            if image.mode != 'RGBA':
+                return image.convert('RGBA')
+            return image
+
+        def convert_transparent_to_rgb(image):
+            if image.mode != 'RGB':
+                return image.convert('RGB')
+            return image
+
+        def resize_to_minimum_size(min_size, image):
+            if max(*image.size) < min_size:
+                return torchvision.transforms.functional.resize(image, min_size)
+            return image
+
+        class expand_greyscale(object):
+            def __init__(self, transparent):
+                self.transparent = transparent
+
+            def __call__(self, tensor):
+                channels = tensor.shape[0]
+                num_target_channels = 4 if self.transparent else 3
+
+                if channels == num_target_channels:
+                    return tensor
+
+                alpha = None
+                if channels == 1:
+                    color = tensor.expand(3, -1, -1)
+                elif channels == 2:
+                    color = tensor[:1].expand(3, -1, -1)
+                    alpha = tensor[1:]
+                else:
+                    raise Exception(f'image with invalid number of channels given {channels}')
+
+                if not exists(alpha) and self.transparent:
+                    alpha = torch.ones(1, *tensor.shape[1:], device=tensor.device)
+
+                return color if not self.transparent else torch.cat((color, alpha))
+        
+        class RandomApply(nn.Module):
+            def __init__(self, prob, fn, fn_else = lambda x: x):
+                super().__init__()
+                self.fn = fn
+                self.fn_else = fn_else
+                self.prob = prob
+            def forward(self, x):
+                fn = self.fn if random() < self.prob else self.fn_else
+                return fn(x)
+        
+        convert_image_fn = convert_transparent_to_rgb if not self.transparent else convert_rgb_to_transparent
+        num_channels = 3 if not self.transparent else 4
+
+        transform = transforms.Compose([
+            transforms.Lambda(convert_image_fn),
+            transforms.Lambda(partial(resize_to_minimum_size, self.image_size)),
+            transforms.Resize(self.image_size),
+            RandomApply(self.aug_prob, transforms.RandomResizedCrop(self.image_size, scale=(0.5, 1.0), ratio=(0.98, 1.02)), transforms.CenterCrop(self.image_size)),
+            transforms.ToTensor(),
+            transforms.Lambda(expand_greyscale(self.transparent))
+        ])
+
+        def transform_images(examples):
+            transformed_images = [transform(image.convert("RGB")) for image in examples["image"]]
+
+            examples["image"] = torch.stack(transformed_images)
+  
+            return examples
+
+        transformed_dataset = dataset.with_transform(transform_images)
+        
         num_workers = num_workers = default(self.num_workers, NUM_CORES if not self.is_ddp else 0)
-        sampler = DistributedSampler(self.dataset, rank=self.rank, num_replicas=self.world_size, shuffle=True) if self.is_ddp else None
-        dataloader = DataLoader(self.dataset, num_workers = num_workers, batch_size = math.ceil(self.batch_size / self.world_size), sampler = sampler, shuffle = not self.is_ddp, drop_last = True, pin_memory = True)
+        sampler = DistributedSampler(transformed_dataset["train"], rank=self.rank, num_replicas=self.world_size, shuffle=True) if self.is_ddp else None
+        dataloader = DataLoader(transformed_dataset["train"], num_workers=num_workers, batch_size = math.ceil(self.batch_size / self.world_size), sampler = sampler, shuffle = not self.is_ddp, drop_last = True, pin_memory = True)
+        num_samples = len(transformed_dataset)
+        ## end of HuggingFace dataset
+
+        # self.dataset = Dataset(folder, self.image_size, transparent = self.transparent, aug_prob = self.dataset_aug_prob)
+        # num_workers = num_workers = default(self.num_workers, NUM_CORES if not self.is_ddp else 0)
+        # sampler = DistributedSampler(self.dataset, rank=self.rank, num_replicas=self.world_size, shuffle=True) if self.is_ddp else None
+        #dataloader = DataLoader(self.dataset, num_workers = num_workers, batch_size = math.ceil(self.batch_size / self.world_size), sampler = sampler, shuffle = not self.is_ddp, drop_last = True, pin_memory = True)
         self.loader = cycle(dataloader)
 
         # auto set augmentation prob for user if dataset is detected to be low
-        num_samples = len(self.dataset)
+        #num_samples = len(self.dataset)
         if not exists(self.aug_prob) and num_samples < 1e5:
             self.aug_prob = min(0.5, (1e5 - num_samples) * 3e-6)
             print(f'autosetting augmentation probability to {round(self.aug_prob * 100)}%')
@@ -415,7 +499,7 @@ class Trainer():
                     self.GAN.D_cl(generated_images.clone().detach(), accumulate=True)
 
             for i in range(self.gradient_accumulate_every):
-                image_batch = next(self.loader).cuda(self.rank)
+                image_batch = next(self.loader)["image"].cuda(self.rank)
                 self.GAN.D_cl(image_batch, accumulate=True)
 
             loss = self.GAN.D_cl.calculate_loss()
@@ -451,7 +535,7 @@ class Trainer():
             generated_images = G(w_styles, noise)
             fake_output, fake_q_loss = D_aug(generated_images.clone().detach(), detach = True, **aug_kwargs)
 
-            image_batch = next(self.loader).cuda(self.rank)
+            image_batch = next(self.loader)["image"].cuda(self.rank)
             image_batch.requires_grad_()
             real_output, real_q_loss = D_aug(image_batch, **aug_kwargs)
 
@@ -505,7 +589,7 @@ class Trainer():
 
             real_output = None
             if G_requires_reals:
-                image_batch = next(self.loader).cuda(self.rank)
+                image_batch = next(self.loader)["image"].cuda(self.rank)
                 real_output, _ = D_aug(image_batch, detach = True, **aug_kwargs)
                 real_output = real_output.detach()
 
@@ -639,7 +723,7 @@ class Trainer():
             os.makedirs(real_path)
 
             for batch_num in tqdm(range(num_batches), desc='calculating FID - saving reals'):
-                real_batch = next(self.loader)
+                real_batch = next(self.loader)["image"]
                 for k, image in enumerate(real_batch.unbind(0)):
                     filename = str(k + batch_num * self.batch_size)
                     torchvision.utils.save_image(image, str(real_path / f'{filename}.png'))
