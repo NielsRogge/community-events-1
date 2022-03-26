@@ -35,6 +35,8 @@ from dataset import Dataset
 
 from datasets import load_dataset
 
+from accelerate import Accelerator
+
 try:
     from apex import amp
     APEX_AVAILABLE = True
@@ -221,9 +223,6 @@ class Trainer():
         calculate_fid_every = None,
         calculate_fid_num_images = 12800,
         clear_fid_cache = False,
-        is_ddp = False,
-        rank = 0,
-        world_size = 1,
         log = False,
         *args,
         **kwargs
@@ -306,10 +305,6 @@ class Trainer():
         self.dual_contrast_loss = dual_contrast_loss
 
         assert not (is_ddp and cl_reg), 'Contrastive loss regularization does not work well with multi GPUs yet'
-        self.is_ddp = is_ddp
-        self.is_main = rank == 0
-        self.rank = rank
-        self.world_size = world_size
 
         self.logger = aim.Session(experiment=name) if log else None
 
@@ -329,12 +324,12 @@ class Trainer():
         args, kwargs = self.GAN_params
         self.GAN = StyleGAN2(lr = self.lr, lr_mlp = self.lr_mlp, ttur_mult = self.ttur_mult, image_size = self.image_size, network_capacity = self.network_capacity, fmap_max = self.fmap_max, transparent = self.transparent, fq_layers = self.fq_layers, fq_dict_size = self.fq_dict_size, attn_layers = self.attn_layers, fp16 = self.fp16, cl_reg = self.cl_reg, no_const = self.no_const, rank = self.rank, *args, **kwargs)
 
-        if self.is_ddp:
-            ddp_kwargs = {'device_ids': [self.rank]}
-            self.S_ddp = DDP(self.GAN.S, **ddp_kwargs)
-            self.G_ddp = DDP(self.GAN.G, **ddp_kwargs)
-            self.D_ddp = DDP(self.GAN.D, **ddp_kwargs)
-            self.D_aug_ddp = DDP(self.GAN.D_aug, **ddp_kwargs)
+        # if self.is_ddp:
+        #     ddp_kwargs = {'device_ids': [self.rank]}
+        #     self.S_ddp = DDP(self.GAN.S, **ddp_kwargs)
+        #     self.G_ddp = DDP(self.GAN.G, **ddp_kwargs)
+        #     self.D_ddp = DDP(self.GAN.D, **ddp_kwargs)
+        #     self.D_aug_ddp = DDP(self.GAN.D_aug, **ddp_kwargs)
 
         if exists(self.logger):
             self.logger.set_params(self.hparams)
@@ -453,6 +448,8 @@ class Trainer():
             print(f'autosetting augmentation probability to {round(self.aug_prob * 100)}%')
 
     def train(self):
+        accelerator = Accelerator(fp16=self.fp16)
+        
         assert exists(self.loader), 'You must first initialize the data source with `.set_data_src(<folder of images>)`'
 
         if not exists(self.GAN):
@@ -476,12 +473,13 @@ class Trainer():
         apply_path_penalty = not self.no_pl_reg and self.steps > 5000 and self.steps % 32 == 0
         apply_cl_reg_to_generated = self.steps > 20000
 
-        S = self.GAN.S if not self.is_ddp else self.S_ddp
-        G = self.GAN.G if not self.is_ddp else self.G_ddp
-        D = self.GAN.D if not self.is_ddp else self.D_ddp
-        D_aug = self.GAN.D_aug if not self.is_ddp else self.D_aug_ddp
+        S = self.GAN.S
+        G = self.GAN.G
+        D = self.GAN.D
+        D_aug = self.GAN.D_aug
 
-        backwards = partial(loss_backwards, self.fp16)
+        # PREPARE
+        S, G, D, D_aug, self.GAN.D_opt, self.GAN.G_opt = accelerator.prepare(S, G, D, D_aug, self.GAN.D_opt, self.GAN.G_opt, self.loader)
 
         if exists(self.GAN.D_cl):
             self.GAN.D_opt.zero_grad()
@@ -489,8 +487,8 @@ class Trainer():
             if apply_cl_reg_to_generated:
                 for i in range(self.gradient_accumulate_every):
                     get_latents_fn = mixed_list if random() < self.mixed_prob else noise_list
-                    style = get_latents_fn(batch_size, num_layers, latent_dim, device=self.rank)
-                    noise = image_noise(batch_size, image_size, device=self.rank)
+                    style = get_latents_fn(batch_size, num_layers, latent_dim, device=accelerator.device)
+                    noise = image_noise(batch_size, image_size, device=accelerator.device)
 
                     w_space = latent_to_w(self.GAN.S, style)
                     w_styles = styles_def_to_tensor(w_space)
@@ -499,12 +497,12 @@ class Trainer():
                     self.GAN.D_cl(generated_images.clone().detach(), accumulate=True)
 
             for i in range(self.gradient_accumulate_every):
-                image_batch = next(self.loader)["image"].cuda(self.rank)
+                image_batch = next(self.loader)["image"]
                 self.GAN.D_cl(image_batch, accumulate=True)
 
             loss = self.GAN.D_cl.calculate_loss()
             self.last_cr_loss = loss.clone().detach().item()
-            backwards(loss, self.GAN.D_opt, loss_id = 0)
+            accelerator.backward(loss)
 
             self.GAN.D_opt.step()
 
@@ -526,8 +524,8 @@ class Trainer():
 
         for i in gradient_accumulate_contexts(self.gradient_accumulate_every, self.is_ddp, ddps=[D_aug, S, G]):
             get_latents_fn = mixed_list if random() < self.mixed_prob else noise_list
-            style = get_latents_fn(batch_size, num_layers, latent_dim, device=self.rank)
-            noise = image_noise(batch_size, image_size, device=self.rank)
+            style = get_latents_fn(batch_size, num_layers, latent_dim, device=accelerator.device)
+            noise = image_noise(batch_size, image_size, device=accelerator.device)
 
             w_space = latent_to_w(S, style)
             w_styles = styles_def_to_tensor(w_space)
@@ -535,7 +533,7 @@ class Trainer():
             generated_images = G(w_styles, noise)
             fake_output, fake_q_loss = D_aug(generated_images.clone().detach(), detach = True, **aug_kwargs)
 
-            image_batch = next(self.loader)["image"].cuda(self.rank)
+            image_batch = next(self.loader)["image"]
             image_batch.requires_grad_()
             real_output, real_q_loss = D_aug(image_batch, **aug_kwargs)
 
@@ -563,7 +561,7 @@ class Trainer():
 
             disc_loss = disc_loss / self.gradient_accumulate_every
             disc_loss.register_hook(raise_if_nan)
-            backwards(disc_loss, self.GAN.D_opt, loss_id = 1)
+            accelerator.backward(disc_loss)
 
             total_disc_loss += divergence.detach().item() / self.gradient_accumulate_every
 
@@ -577,8 +575,8 @@ class Trainer():
         self.GAN.G_opt.zero_grad()
 
         for i in gradient_accumulate_contexts(self.gradient_accumulate_every, self.is_ddp, ddps=[S, G, D_aug]):
-            style = get_latents_fn(batch_size, num_layers, latent_dim, device=self.rank)
-            noise = image_noise(batch_size, image_size, device=self.rank)
+            style = get_latents_fn(batch_size, num_layers, latent_dim, device=accelerator.device)
+            noise = image_noise(batch_size, image_size, device=accelerator.device)
 
             w_space = latent_to_w(S, style)
             w_styles = styles_def_to_tensor(w_space)
@@ -589,7 +587,7 @@ class Trainer():
 
             real_output = None
             if G_requires_reals:
-                image_batch = next(self.loader)["image"].cuda(self.rank)
+                image_batch = next(self.loader)["image"]
                 real_output, _ = D_aug(image_batch, detach = True, **aug_kwargs)
                 real_output = real_output.detach()
 
@@ -615,7 +613,7 @@ class Trainer():
 
             gen_loss = gen_loss / self.gradient_accumulate_every
             gen_loss.register_hook(raise_if_nan)
-            backwards(gen_loss, self.GAN.G_opt, loss_id = 2)
+            accelerator.backward(gen_loss)
 
             total_gen_loss += loss.detach().item() / self.gradient_accumulate_every
 
@@ -675,8 +673,8 @@ class Trainer():
 
         # latents and noise
 
-        latents = noise_list(num_rows ** 2, num_layers, latent_dim, device=self.rank)
-        n = image_noise(num_rows ** 2, image_size, device=self.rank)
+        latents = noise_list(num_rows ** 2, num_layers, latent_dim, device=accelerator.device)
+        n = image_noise(num_rows ** 2, image_size, device=accelerator.device)
 
         # regular
 
@@ -695,10 +693,10 @@ class Trainer():
             repeat_idx = [1] * a.dim()
             repeat_idx[dim] = n_tile
             a = a.repeat(*(repeat_idx))
-            order_index = torch.LongTensor(np.concatenate([init_dim * np.arange(n_tile) + i for i in range(init_dim)])).cuda(self.rank)
+            order_index = torch.LongTensor(np.concatenate([init_dim * np.arange(n_tile) + i for i in range(init_dim)]), device=accelerator.device)
             return torch.index_select(a, dim, order_index)
 
-        nn = noise(num_rows, latent_dim, device=self.rank)
+        nn = noise(num_rows, latent_dim, device=accelerator.device)
         tmp1 = tile(nn, 0, num_rows)
         tmp2 = nn.repeat(num_rows, 1)
 
@@ -742,8 +740,8 @@ class Trainer():
 
         for batch_num in tqdm(range(num_batches), desc='calculating FID - saving generated'):
             # latents and noise
-            latents = noise_list(self.batch_size, num_layers, latent_dim, device=self.rank)
-            noise = image_noise(self.batch_size, image_size, device=self.rank)
+            latents = noise_list(self.batch_size, num_layers, latent_dim, device=accelerator.device)
+            noise = image_noise(self.batch_size, image_size, device=accelerator.device)
 
             # moving averages
             generated_images = self.generate_truncated(self.GAN.SE, self.GAN.GE, latents, noise, trunc_psi = self.trunc_psi)
@@ -760,12 +758,12 @@ class Trainer():
         latent_dim = self.GAN.G.latent_dim
 
         if not exists(self.av):
-            z = noise(2000, latent_dim, device=self.rank)
+            z = noise(2000, latent_dim, device=accelerator.device)
             samples = evaluate_in_chunks(batch_size, S, z).cpu().numpy()
             self.av = np.mean(samples, axis = 0)
             self.av = np.expand_dims(self.av, axis = 0)
 
-        av_torch = torch.from_numpy(self.av).cuda(self.rank)
+        av_torch = torch.from_numpy(self.av, device=accelerator.device)
         tensor = trunc_psi * (tensor - av_torch) + av_torch
         return tensor
 
@@ -797,9 +795,9 @@ class Trainer():
 
         # latents and noise
 
-        latents_low = noise(num_rows ** 2, latent_dim, device=self.rank)
-        latents_high = noise(num_rows ** 2, latent_dim, device=self.rank)
-        n = image_noise(num_rows ** 2, image_size, device=self.rank)
+        latents_low = noise(num_rows ** 2, latent_dim, device=accelerator.device)
+        latents_high = noise(num_rows ** 2, latent_dim, device=accelerator.device)
+        n = image_noise(num_rows ** 2, image_size, device=accelerator.device)
 
         ratios = torch.linspace(0., 8., num_steps)
 
@@ -904,7 +902,7 @@ class ModelLoader:
         self.model.load(load_from)
 
     def noise_to_styles(self, noise, trunc_psi = None):
-        noise = noise.cuda()
+        noise = noise.to(self.accelerator.device)
         w = self.model.GAN.SE(noise)
         if exists(trunc_psi):
             w = self.model.truncate_style(w)
