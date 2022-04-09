@@ -19,6 +19,7 @@ from pathlib import Path
 import numpy as np
 import time
 import datetime
+import logging
 import sys
 import tempfile
 
@@ -39,15 +40,18 @@ import torch.nn as nn
 import torch
 
 from huggan.utils.hub import get_full_repo_name
-from huggingface_hub import create_repo
+from huggingface_hub import Repository
+
+logger = logging.getLogger(__name__)
 
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, default="huggan/facades", help="Dataset to use")
+    parser.add_argument("--dataset_name", type=str, default="huggan/facades", help="name of the dataset to train on")
+    parser.add_argument("--cache_dir", type=str, help="path to a folder in which the dataset will be cached.")
+    parser.add_argument("--output_dir", type=str, default=None, help="where to store the model and logs.")
     parser.add_argument("--epoch", type=int, default=0, help="epoch to start training from")
     parser.add_argument("--n_epochs", type=int, default=200, help="number of epochs of training")
-    parser.add_argument("--dataset_name", type=str, default="facades", help="name of the dataset")
     parser.add_argument("--batch_size", type=int, default=1, help="size of the batches")
     parser.add_argument("--lr", type=float, default=0.0002, help="adam: learning rate")
     parser.add_argument("--b1", type=float, default=0.5, help="adam: decay of first order momentum of gradient")
@@ -71,31 +75,35 @@ def parse_args(args=None):
         "and an Nvidia Ampere GPU.",
     )
     parser.add_argument("--cpu", action="store_true", help="If passed, will train on the CPU.")
+    parser.add_argument("--wandb", action="store_true", help="Whether or not to log to Weights and Biases.")
+    parser.add_argument(
+        "--logging_steps",
+        type=int,
+        default=50,
+        help="Number of steps between each logging",
+    )
     parser.add_argument(
         "--push_to_hub",
         action="store_true",
         help="Whether to push the model to the HuggingFace hub after training.",
         )
     parser.add_argument(
-        "--pytorch_dump_folder_path",
-        required="--push_to_hub" in sys.argv,
-        type=Path,
-        help="Path to save the model. Will be created if it doesn't exist already.",
+        "--hub_model_id", type=str, help="The name of the repository to keep in sync with the local `output_dir`."
     )
-    parser.add_argument(
-        "--model_name",
-        required="--push_to_hub" in sys.argv,
-        type=str,
-        help="Name of the model on the hub.",
-    )
-    parser.add_argument(
-        "--organization_name",
-        required=False,
-        default="huggan",
-        type=str,
-        help="Organization name to push to, in case args.push_to_hub is specified.",
-    )
-    return parser.parse_args(args=args)
+    parser.add_argument("--hub_token", type=str, help="The token to use to push to the Model Hub.")
+    
+    args = parser.parse_args()
+    
+    # Sanity checks
+    if args.push_to_hub or args.wandb:
+        assert (
+            args.output_dir is not None
+        ), "Need an `output_dir` to create a repo when `--push_to_hub` or `--wandb` is passed."
+
+    if args.output_dir is not None:
+        os.makedirs(args.output_dir, exist_ok=True)
+    
+    return args
 
 # Custom weights initialization called on Generator and Discriminator
 def weights_init_normal(m):
@@ -109,12 +117,31 @@ def weights_init_normal(m):
 def training_function(config, args):
     accelerator = Accelerator(fp16=args.fp16, cpu=args.cpu, mixed_precision=args.mixed_precision)
 
+    # Setup logging, we only want one process per machine to log things on the screen.
+    # accelerator.is_local_main_process is only True for one process per machine.
+    logger.setLevel(logging.INFO if accelerator.is_local_main_process else logging.ERROR)
+    if accelerator.is_local_main_process:
+        # set up Weights and Biases if requested
+        if args.wandb:
+            import wandb
+
+            wandb.init(project=str(args.output_dir).split("/")[-1])   
+
     os.makedirs("images/%s" % args.dataset_name, exist_ok=True)
     os.makedirs("saved_models/%s" % args.dataset_name, exist_ok=True)
     
-    repo_name = get_full_repo_name(args.model_name, args.organization_name)
-    if args.push_to_hub:
-        repo_url = create_repo(repo_name, exist_ok=True)
+    # Handle the repository creation
+    if accelerator.is_main_process:
+        if args.push_to_hub:
+            if args.hub_model_id is None:
+                repo_name = get_full_repo_name(Path(args.output_dir).name, token=args.hub_token)
+            else:
+                repo_name = args.hub_model_id
+            repo = Repository(args.output_dir, clone_from=repo_name)
+        elif args.output_dir is not None:
+            os.makedirs(args.output_dir, exist_ok=True)
+    accelerator.wait_for_everyone()
+    
     # Loss functions
     criterion_GAN = torch.nn.MSELoss()
     criterion_pixelwise = torch.nn.L1Loss()
@@ -171,7 +198,7 @@ def training_function(config, args):
 
         return examples
 
-    dataset = load_dataset(args.dataset)
+    dataset = load_dataset(args.dataset_name, cache_dir=args.cache_dir)
     transformed_dataset = dataset.with_transform(transforms)
 
     splits = transformed_dataset['train'].train_test_split(test_size=0.1)
@@ -199,6 +226,7 @@ def training_function(config, args):
     prev_time = time.time()
 
     for epoch in range(args.epoch, args.n_epochs):
+        print("Epoch:", epoch)
         for i, batch in enumerate(dataloader):
 
             # Model inputs
@@ -258,22 +286,36 @@ def training_function(config, args):
             batches_left = args.n_epochs * len(dataloader) - batches_done
             time_left = datetime.timedelta(seconds=batches_left * (time.time() - prev_time))
             prev_time = time.time()
+            
+            if (i + 1) % args.logging_steps == 0:
+                loss_D.detach()
+                loss_G.detach()
+                loss_pixel.detach()
+                loss_GAN.detach()
 
-            # Print log
-            sys.stdout.write(
-                "\r[Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f, pixel: %f, adv: %f] ETA: %s"
-                % (
-                    epoch,
-                    args.n_epochs,
-                    i,
-                    len(dataloader),
-                    loss_D.item(),
-                    loss_G.item(),
-                    loss_pixel.item(),
-                    loss_GAN.item(),
-                    time_left,
-                )
-            )
+                if accelerator.state.num_processes > 1:
+                    loss_D = accelerator.gather(loss_D).sum() / accelerator.state.num_processes
+                    loss_D = accelerator.gather(loss_D).sum() / accelerator.state.num_processes
+                    loss_pixel = accelerator.gather(loss_pixel).sum() / accelerator.state.num_processes
+                    loss_GAN = accelerator.gather(loss_GAN).sum() / accelerator.state.num_processes
+                
+                train_logs = {
+                    "epoch": epoch,
+                    "discriminator_loss": loss_D,
+                    "generator_loss": loss_D,
+                    "pixel_loss": loss_pixel,
+                    "GAN_loss": loss_GAN,
+                }
+                log_str = ""
+                for k, v in train_logs.items():
+                    log_str += "| {}: {:.3e}".format(k, v)
+
+                if accelerator.is_local_main_process:
+                    logger.info(log_str)
+                    if args.wandb:
+                        import wandb
+
+                        wandb.log(train_logs)
 
             # If at sample interval save image
             if batches_done % args.sample_interval == 0:
@@ -284,24 +326,30 @@ def training_function(config, args):
             torch.save(generator.state_dict(), "saved_models/%s/generator_%d.pth" % (args.dataset_name, epoch))
             torch.save(discriminator.state_dict(), "saved_models/%s/discriminator_%d.pth" % (args.dataset_name, epoch))
 
-        # Optionally push to hub
-        if args.push_to_hub:
-            save_directory = args.pytorch_dump_folder_path
-            if not save_directory.exists():
-                save_directory.mkdir(parents=True)
-            with tempfile.TemporaryDirectory() as temp_dir:
-                generator.push_to_hub(
-                    repo_path_or_name=temp_dir,
-                    repo_url=repo_url,
-                    skip_lfs_files=True
+            # Optionally push generator to the hub
+            if args.push_to_hub and accelerator.is_main_process:
+                unwrapped_generator = accelerator.unwrap_model(generator)
+                unwrapped_generator.save_pretrained(args.output_dir)
+                repo.push_to_hub(
+                    commit_message=f"Training in progress, epoch {epoch}",
+                    blocking=False,
+                    auto_lfs_prune=True,
                 )
+
+    # Optionally push generator to the hub
+    if args.push_to_hub and accelerator.is_main_process:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            unwrapped_generator = accelerator.unwrap_model(generator)
+            unwrapped_generator.save_pretrained(args.output_dir)
+            repo.push_to_hub(
+                commit_message=f"End of training",
+                blocking=False,
+                auto_lfs_prune=True,
+            )
 
 def main():
     args = parse_args()
     print(args)
-
-    # Make directory for saving generated images
-    os.makedirs("images", exist_ok=True)
 
     training_function({}, args)
 
